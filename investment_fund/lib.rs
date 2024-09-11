@@ -2,17 +2,21 @@
 
 #[ink::contract]
 pub mod investment_fund {
-    use ink::{env::{
-        call::{build_call, ExecutionInput, Selector},
-        CallFlags, DefaultEnvironment,
-    }, storage::{traits::ManualKey, Lazy, Mapping}};
+    use crate::investment_fund::Error::{ArithmeticError, NotEnoughShares};
     use ink::codegen::Env;
-    use crate::investment_fund::Error::ArithmeticError;
+    use ink::{
+        env::{
+            call::{build_call, ExecutionInput, Selector},
+            CallFlags, DefaultEnvironment,
+        },
+        storage::{traits::ManualKey, Lazy, Mapping},
+    };
 
     #[derive(Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(::scale_info::TypeInfo))]
     pub enum Error {
         ArithmeticError,
+        NotEnoughShares,
     }
 
     #[ink(storage)]
@@ -86,22 +90,36 @@ pub mod investment_fund {
             let shares = self.users.get(caller).unwrap_or(0);
             let new_shares = match self.calculate_shares(amount) {
                 Ok(v) => v,
-                Err(e) =>  return Err(e.into())
+                Err(e) => return Err(e.into()),
             };
             match self.users_total_shares.checked_add(new_shares) {
                 Some(v) => self.users_total_shares = v,
                 None => return Err(ArithmeticError.into()),
             }
-            self.users.insert(caller, &(shares.checked_add(new_shares).unwrap_or_default()));
+            self.users.insert(
+                caller,
+                &(shares.checked_add(new_shares).unwrap_or_default()),
+            );
             Ok(())
         }
 
         #[ink(message)]
         pub fn withdraw(&mut self, amount: Balance) -> Result<(), Error> {
             let caller = self.env().caller();
-            let shares = self.users.get(caller).unwrap_or(0);
-            self.users.insert(caller, &(shares.saturating_sub(amount)));
-            let _ = self.users_total_shares.saturating_sub(amount);
+            let shares = self.users.get(caller).unwrap_or_default();
+
+            if shares < amount {
+                return Err(NotEnoughShares.into());
+            }
+
+            self.users
+                .insert(caller, &(shares.checked_sub(amount).unwrap()));
+
+            match self.users_total_shares.checked_sub(amount) {
+                Some(v) => self.users_total_shares = v,
+                None => return Err(NotEnoughShares.into()),
+            };
+
             let Ok(removed_tokens) = self.calculate_tokens(amount) else {
                 return Err(ArithmeticError.into());
             };
@@ -114,14 +132,17 @@ pub mod investment_fund {
                 let selector = ink::selector_bytes!("retrieve_tokens");
                 let _ = build_call::<DefaultEnvironment>()
                     .delegate(self.strategy())
-                    .call_flags(CallFlags::TAIL_CALL)
-                    .exec_input(ExecutionInput::new(Selector::new(selector)).push_arg(&removed_tokens))
+                    .exec_input(
+                        ExecutionInput::new(Selector::new(selector)).push_arg(&removed_tokens),
+                    )
                     .returns::<()>()
                     .try_invoke()
                     .expect("Failed to invoke retrieve_tokens on strategy");
             }
-            self.env().transfer(caller, removed_tokens.checked_sub(fee).unwrap()).expect("Transfer failed");
-            self.env().transfer(caller, fee).expect("Transfer failed");
+            self.env()
+                .transfer(caller, removed_tokens.checked_sub(fee).unwrap())
+                .expect("Transfer failed");
+            self.env().transfer(self.manager, fee).expect("Transfer failed");
 
             Ok(())
         }
@@ -169,7 +190,11 @@ pub mod investment_fund {
         }
 
         fn caller_is_manager(&self) {
-            assert_eq!(self.env().caller(), self.manager, "caller is not the manager");
+            assert_eq!(
+                self.env().caller(),
+                self.manager,
+                "caller is not the manager"
+            );
         }
     }
 }
