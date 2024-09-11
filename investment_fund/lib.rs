@@ -107,24 +107,15 @@ pub mod investment_fund {
         pub fn withdraw(&mut self, amount: Balance) -> Result<(), Error> {
             let caller = self.env().caller();
             let shares = self.users.get(caller).unwrap_or_default();
+            self.users.insert(caller, &(shares.checked_sub(amount).unwrap()));
 
-            if shares < amount {
-                return Err(NotEnoughShares.into());
-            }
-
-            self.users
-                .insert(caller, &(shares.checked_sub(amount).unwrap()));
-
-            match self.users_total_shares.checked_sub(amount) {
-                Some(v) => self.users_total_shares = v,
-                None => return Err(NotEnoughShares.into()),
-            };
+            self.users_total_shares.checked_sub(amount).unwrap();
 
             let Ok(removed_tokens) = self.calculate_tokens(amount) else {
                 return Err(ArithmeticError.into());
             };
 
-            let fee = removed_tokens.checked_mul(self.fee).unwrap().checked_div(100).unwrap();
+            let fee = removed_tokens.checked_div(100).unwrap().checked_mul(self.fee).unwrap();
 
             // Ensure contract has enough balance to fulfill the withdrawal
             if self.env().balance() < removed_tokens {
