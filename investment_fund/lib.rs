@@ -31,7 +31,7 @@ pub mod investment_fund {
 
     impl InvestmentFund {
         #[ink(constructor)]
-        pub fn new(hash: Hash) -> Self {
+        pub fn new(hash: Hash, fee: u128) -> Self {
             let v = Mapping::new();
 
             let mut strategy = Lazy::new();
@@ -43,7 +43,7 @@ pub mod investment_fund {
                 strategy,
                 manager: Self::env().caller(),
                 users_total_shares: 0,
-                fee: 3,
+                fee,
             }
         }
         #[ink(message)]
