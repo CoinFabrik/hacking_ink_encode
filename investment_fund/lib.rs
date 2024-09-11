@@ -2,7 +2,7 @@
 
 #[ink::contract]
 pub mod investment_fund {
-    use crate::investment_fund::Error::{ArithmeticError, NotEnoughShares};
+    use crate::investment_fund::Error::{ArithmeticError, InvokeError, NotEnoughShares};
     use ink::codegen::Env;
     use ink::{
         env::{
@@ -17,6 +17,7 @@ pub mod investment_fund {
     pub enum Error {
         ArithmeticError,
         NotEnoughShares,
+        InvokeError,
     }
 
     #[ink(storage)]
@@ -56,13 +57,12 @@ pub mod investment_fund {
             self.strategy.set(&hash);
         }
 
-        /// Increment the current value using delegate call.
         #[ink(message)]
-        pub fn invest_in_strategy(&mut self) {
+        pub fn invest_in_strategy(&mut self) -> Result<(), Error> {
             self.caller_is_manager();
 
             let selector = ink::selector_bytes!("activate");
-            let _ = build_call::<DefaultEnvironment>()
+            match build_call::<DefaultEnvironment>()
                 .delegate(self.strategy())
                 // We specify `CallFlags::TAIL_CALL` to use the delegatee last memory frame
                 // as the end of the execution cycle.
@@ -75,7 +75,11 @@ pub mod investment_fund {
                 .call_flags(CallFlags::TAIL_CALL)
                 .exec_input(ExecutionInput::new(Selector::new(selector)))
                 .returns::<()>()
-                .try_invoke();
+                .try_invoke()
+            {
+                Ok(_) => Ok(()),
+                Err(_) => Err(InvokeError.into()),
+            }
         }
 
         #[ink(message)]
@@ -124,31 +128,42 @@ pub mod investment_fund {
                 return Err(ArithmeticError.into());
             };
 
-            let fee = removed_tokens.checked_mul(self.fee).unwrap().checked_div(100).unwrap();
+            let fee = removed_tokens
+                .checked_mul(self.fee)
+                .unwrap()
+                .checked_div(100)
+                .unwrap();
 
             // Ensure contract has enough balance to fulfill the withdrawal
             if self.env().balance() < removed_tokens {
                 // Retrieve required tokens from strategy
                 let selector = ink::selector_bytes!("retrieve_tokens");
-                let _ = build_call::<DefaultEnvironment>()
+                match build_call::<DefaultEnvironment>()
                     .delegate(self.strategy())
                     .exec_input(
                         ExecutionInput::new(Selector::new(selector)).push_arg(&removed_tokens),
                     )
                     .returns::<()>()
                     .try_invoke()
-                    .expect("Failed to invoke retrieve_tokens on strategy");
+                {
+                    Ok(_) => {}
+                    Err(_) => {
+                        return Err(InvokeError.into());
+                    }
+                }
             }
             self.env()
                 .transfer(caller, removed_tokens.checked_sub(fee).unwrap())
                 .expect("Transfer failed");
-            self.env().transfer(self.manager, fee).expect("Transfer failed");
+            self.env()
+                .transfer(self.manager, fee)
+                .expect("Transfer failed");
 
             Ok(())
         }
 
         #[ink(message)]
-        pub fn calculate_shares(&self, amount: Balance) -> Result<Balance, Error> {
+        pub fn calculate_shares(&mut self, amount: Balance) -> Result<Balance, Error> {
             let total_shares: Balance = self.users_total_shares;
             if total_shares == 0 {
                 Ok(amount)
@@ -173,11 +188,15 @@ pub mod investment_fund {
         pub fn calculate_tokens(&self, shares: Balance) -> Result<Balance, Error> {
             let total_shares: Balance = self.users_total_shares;
             let selector = ink::selector_bytes!("get_balance");
-            let strategy_balance: Balance = build_call::<DefaultEnvironment>()
+            let strategy_balance: Balance = match build_call::<DefaultEnvironment>()
                 .delegate(self.strategy())
                 .exec_input(ExecutionInput::new(Selector::new(selector)))
                 .returns::<Balance>()
-                .invoke();
+                .try_invoke()
+            {
+                Ok(v) => v.unwrap(),
+                Err(_) => return Err(InvokeError.into()),
+            };
 
             match shares.checked_mul(strategy_balance) {
                 Some(v) => Ok(v.checked_div(total_shares).unwrap_or_default()),
