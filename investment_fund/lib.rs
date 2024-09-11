@@ -6,6 +6,7 @@ pub mod investment_fund {
         call::{build_call, ExecutionInput, Selector},
         CallFlags, DefaultEnvironment,
     }, storage::{traits::ManualKey, Lazy, Mapping}};
+    use ink::codegen::Env;
     use crate::investment_fund::Error::ArithmeticError;
 
     #[derive(Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
@@ -17,9 +18,10 @@ pub mod investment_fund {
     #[ink(storage)]
     pub struct InvestmentFund {
         users: Mapping<AccountId, Balance, ManualKey<0xCF>>,
-        strategy: Lazy<Hash>,
+        strategy: Lazy<Hash, ManualKey<0xCFCF>>,
         manager: AccountId,
         users_total_shares: u128,
+        fee: u128,
     }
 
     impl InvestmentFund {
@@ -36,6 +38,7 @@ pub mod investment_fund {
                 strategy,
                 manager: Self::env().caller(),
                 users_total_shares: 0,
+                fee: 3,
             }
         }
         #[ink(message)]
@@ -81,7 +84,10 @@ pub mod investment_fund {
             let caller = self.env().caller();
             let amount = self.env().transferred_value();
             let shares = self.users.get(caller).unwrap_or(0);
-            let new_shares = self.calculate_shares(amount);
+            let new_shares = match self.calculate_shares(amount) {
+                Ok(v) => v,
+                Err(e) =>  return Err(e.into())
+            };
             match self.users_total_shares.checked_add(new_shares) {
                 Some(v) => self.users_total_shares = v,
                 None => return Err(ArithmeticError.into()),
@@ -91,12 +97,17 @@ pub mod investment_fund {
         }
 
         #[ink(message)]
-        pub fn withdraw(&mut self, amount: Balance) {
+        pub fn withdraw(&mut self, amount: Balance) -> Result<(), Error> {
             let caller = self.env().caller();
             let shares = self.users.get(caller).unwrap_or(0);
             self.users.insert(caller, &(shares.saturating_sub(amount)));
             let _ = self.users_total_shares.saturating_sub(amount);
-            let removed_tokens = self.calculate_tokens(amount);
+            let Ok(removed_tokens) = self.calculate_tokens(amount) else {
+                return Err(ArithmeticError.into());
+            };
+
+            let fee = removed_tokens.checked_mul(self.fee).unwrap().checked_div(100).unwrap();
+
             // Ensure contract has enough balance to fulfill the withdrawal
             if self.env().balance() < removed_tokens {
                 // Retrieve required tokens from strategy
@@ -109,14 +120,17 @@ pub mod investment_fund {
                     .try_invoke()
                     .expect("Failed to invoke retrieve_tokens on strategy");
             }
-            self.env().transfer(caller, removed_tokens).expect("Transfer failed");
+            self.env().transfer(caller, removed_tokens.checked_sub(fee).unwrap()).expect("Transfer failed");
+            self.env().transfer(caller, fee).expect("Transfer failed");
+
+            Ok(())
         }
 
         #[ink(message)]
-        pub fn calculate_shares(&self, amount: Balance) -> Balance {
+        pub fn calculate_shares(&self, amount: Balance) -> Result<Balance, Error> {
             let total_shares: Balance = self.users_total_shares;
             if total_shares == 0 {
-                amount
+                Ok(amount)
             } else {
                 let selector = ink::selector_bytes!("get_balance");
                 let strategy_balance: Balance = build_call::<DefaultEnvironment>()
@@ -124,12 +138,18 @@ pub mod investment_fund {
                     .exec_input(ExecutionInput::new(Selector::new(selector)))
                     .returns::<Balance>()
                     .invoke();
-                amount.checked_mul(total_shares).unwrap_or_default().checked_div(strategy_balance).unwrap_or_default()
+                match amount.checked_mul(total_shares) {
+                    Some(v) => match v.checked_div(strategy_balance) {
+                        Some(v) => Ok(v),
+                        None => return Err(ArithmeticError.into()),
+                    },
+                    None => return Err(ArithmeticError.into()),
+                }
             }
         }
 
         #[ink(message)]
-        pub fn calculate_tokens(&self, shares: Balance) -> Balance {
+        pub fn calculate_tokens(&self, shares: Balance) -> Result<Balance, Error> {
             let total_shares: Balance = self.users_total_shares;
             let selector = ink::selector_bytes!("get_balance");
             let strategy_balance: Balance = build_call::<DefaultEnvironment>()
@@ -138,7 +158,10 @@ pub mod investment_fund {
                 .returns::<Balance>()
                 .invoke();
 
-            shares.checked_mul(strategy_balance).unwrap_or_default().checked_div(total_shares).unwrap_or_default()
+            match shares.checked_mul(strategy_balance) {
+                Some(v) => Ok(v.checked_div(total_shares).unwrap_or_default()),
+                None => Err(ArithmeticError.into()),
+            }
         }
 
         fn strategy(&self) -> Hash {
