@@ -7,6 +7,8 @@ publish = false
 
 [dependencies]
 ink = { version = "5.0.0", default-features = false }
+scale = { package = "parity-scale-codec", version = "3", default-features = false, features = ["derive"] }
+scale-info = { version = "2.6", default-features = false, features = ["derive"]}
 delegatee = { path = "delegatee", default-features = false, features = ["ink-as-dependency"] }
 delegatee2 = { path = "delegatee2", default-features = false, features = ["ink-as-dependency"] }
 
@@ -20,6 +22,8 @@ path = "lib.rs"
 default = ["std"]
 std = [
     "ink/std",
+    "scale/std",
+    "scale-info/std",
 ]
 ink-as-dependency = []
 e2e-tests = []

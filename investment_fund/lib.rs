@@ -2,26 +2,29 @@
 
 #[ink::contract]
 pub mod investment_fund {
-    use ink::{
-        env::{
-            call::{build_call, ExecutionInput, Selector},
-            CallFlags, DefaultEnvironment,
-        },
-        storage::{traits::ManualKey, Lazy, Mapping},
-    };
-    use ink::codegen::Env;
-    use ink::primitives::Hash;
+    use ink::{env::{
+        call::{build_call, ExecutionInput, Selector},
+        CallFlags, DefaultEnvironment,
+    }, storage::{traits::ManualKey, Lazy, Mapping}};
+    use crate::investment_fund::Error::ArithmeticError;
+
+    #[derive(Debug, PartialEq, Eq, Clone, scale::Encode, scale::Decode)]
+    #[cfg_attr(feature = "std", derive(::scale_info::TypeInfo))]
+    pub enum Error {
+        ArithmeticError,
+    }
 
     #[ink(storage)]
     pub struct InvestmentFund {
         users: Mapping<AccountId, Balance, ManualKey<0xCF>>,
         strategy: Lazy<Hash>,
         manager: AccountId,
+        users_total_shares: u128,
     }
 
     impl InvestmentFund {
         #[ink(constructor)]
-        pub fn new(init_value: i32, hash: Hash) -> Self {
+        pub fn new(hash: Hash) -> Self {
             let v = Mapping::new();
 
             let mut strategy = Lazy::new();
@@ -31,15 +34,10 @@ pub mod investment_fund {
             Self {
                 users: v,
                 strategy,
-                manager: Self::env().caller()
+                manager: Self::env().caller(),
+                users_total_shares: 0,
             }
         }
-
-        /// Update the hash of the contract to delegate to.
-        /// - Unlocks the old delegate dependency, releasing the deposit and allowing old
-        ///   delegated to code to be removed.
-        /// - Adds a new delegate dependency lock, ensuring that the new delegated to code
-        ///   cannot be removed.
         #[ink(message)]
         pub fn update_strategy(&mut self, hash: Hash) {
             self.caller_is_manager();
@@ -74,34 +72,74 @@ pub mod investment_fund {
         }
 
         #[ink(message)]
-        pub fn how_much_deposited(&self) -> Balance {
-            self.users.get(&self.env().caller()).unwrap_or(0)
+        pub fn get_shares(&self) -> Balance {
+            self.users.get(self.env().caller()).unwrap_or(0)
         }
 
         #[ink(message, payable)]
-        pub fn deposit(&mut self) {
+        pub fn deposit(&mut self) -> Result<(), Error> {
             let caller = self.env().caller();
             let amount = self.env().transferred_value();
-            let balance = self.users.get(&caller).unwrap_or(0);
-            self.users.insert(caller, &(balance.saturating_add(amount)));
+            let shares = self.users.get(caller).unwrap_or(0);
+            let new_shares = self.calculate_shares(amount);
+            match self.users_total_shares.checked_add(new_shares) {
+                Some(v) => self.users_total_shares = v,
+                None => return Err(ArithmeticError.into()),
+            }
+            self.users.insert(caller, &(shares.checked_add(new_shares).unwrap_or_default()));
+            Ok(())
         }
 
         #[ink(message)]
-        pub fn calculate_shares(&self) -> Balance {
-            let total_deposits: Balance = self.users.values().sum();
+        pub fn withdraw(&mut self, amount: Balance) {
             let caller = self.env().caller();
-            let balance = self.users.get(&caller).unwrap_or(0);
-            balance * 100 / total_deposits
+            let shares = self.users.get(caller).unwrap_or(0);
+            self.users.insert(caller, &(shares.saturating_sub(amount)));
+            let _ = self.users_total_shares.saturating_sub(amount);
+            let removed_tokens = self.calculate_tokens(amount);
+            // Ensure contract has enough balance to fulfill the withdrawal
+            if self.env().balance() < removed_tokens {
+                // Retrieve required tokens from strategy
+                let selector = ink::selector_bytes!("retrieve_tokens");
+                let _ = build_call::<DefaultEnvironment>()
+                    .delegate(self.strategy())
+                    .call_flags(CallFlags::TAIL_CALL)
+                    .exec_input(ExecutionInput::new(Selector::new(selector)).push_arg(&removed_tokens))
+                    .returns::<()>()
+                    .try_invoke()
+                    .expect("Failed to invoke retrieve_tokens on strategy");
+            }
+            self.env().transfer(caller, removed_tokens).expect("Transfer failed");
         }
 
         #[ink(message)]
-        pub fn calculate_tokens(&self) -> Balance {
-            let total_deposits: Balance = self.env().balance();
-            let caller = self.env().caller();
-            let balance = self.users.get(&caller).unwrap_or(0);
-            balance * 100 / total_deposits
+        pub fn calculate_shares(&self, amount: Balance) -> Balance {
+            let total_shares: Balance = self.users_total_shares;
+            if total_shares == 0 {
+                amount
+            } else {
+                let selector = ink::selector_bytes!("get_balance");
+                let strategy_balance: Balance = build_call::<DefaultEnvironment>()
+                    .delegate(self.strategy())
+                    .exec_input(ExecutionInput::new(Selector::new(selector)))
+                    .returns::<Balance>()
+                    .invoke();
+                amount.checked_mul(total_shares).unwrap_or_default().checked_div(strategy_balance).unwrap_or_default()
+            }
         }
 
+        #[ink(message)]
+        pub fn calculate_tokens(&self, shares: Balance) -> Balance {
+            let total_shares: Balance = self.users_total_shares;
+            let selector = ink::selector_bytes!("get_balance");
+            let strategy_balance: Balance = build_call::<DefaultEnvironment>()
+                .delegate(self.strategy())
+                .exec_input(ExecutionInput::new(Selector::new(selector)))
+                .returns::<Balance>()
+                .invoke();
+
+            shares.checked_mul(strategy_balance).unwrap_or_default().checked_div(total_shares).unwrap_or_default()
+        }
 
         fn strategy(&self) -> Hash {
             self.strategy.get().expect("strategy always has a value")
@@ -110,8 +148,5 @@ pub mod investment_fund {
         fn caller_is_manager(&self) {
             assert_eq!(self.env().caller(), self.manager, "caller is not the manager");
         }
-
-
-
     }
 }
