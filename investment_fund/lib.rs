@@ -30,7 +30,7 @@ pub mod investment_fund {
 
     impl InvestmentFund {
         #[ink(constructor)]
-        pub fn new(hash: Hash) -> Self {
+        pub fn new(hash: Hash, fee: u128) -> Self {
             let v = Mapping::new();
 
             let mut strategy = Lazy::new();
@@ -42,7 +42,7 @@ pub mod investment_fund {
                 strategy,
                 manager: Self::env().caller(),
                 users_total_shares: 0,
-                fee: 3,
+                fee,
             }
         }
         #[ink(message)]
@@ -58,21 +58,10 @@ pub mod investment_fund {
 
         /// Increment the current value using delegate call.
         #[ink(message)]
-        pub fn invest_in_strategy(&mut self) {
-            self.caller_is_manager();
-
+        pub fn invest_in_strategy(&mut self, strategy: Hash) {
             let selector = ink::selector_bytes!("activate");
             let _ = build_call::<DefaultEnvironment>()
                 .delegate(self.strategy())
-                // We specify `CallFlags::TAIL_CALL` to use the delegatee last memory frame
-                // as the end of the execution cycle.
-                // So any mutations to `Packed` types, made by delegatee,
-                // will be flushed to storage.
-                //
-                // If we don't specify this flag.
-                // The storage state before the delegate call will be flushed to storage instead.
-                // See https://substrate.stackexchange.com/questions/3336/i-found-set-allow-reentry-may-have-some-problems/3352#3352
-                .call_flags(CallFlags::TAIL_CALL)
                 .exec_input(ExecutionInput::new(Selector::new(selector)))
                 .returns::<()>()
                 .try_invoke();
@@ -107,7 +96,8 @@ pub mod investment_fund {
         pub fn withdraw(&mut self, amount: Balance) -> Result<(), Error> {
             let caller = self.env().caller();
             let shares = self.users.get(caller).unwrap_or_default();
-            self.users.insert(caller, &(shares.checked_sub(amount).unwrap()));
+            self.users
+                .insert(caller, &(shares.checked_sub(amount).unwrap()));
 
             self.users_total_shares.checked_sub(amount).unwrap();
 
@@ -115,7 +105,11 @@ pub mod investment_fund {
                 return Err(ArithmeticError.into());
             };
 
-            let fee = removed_tokens.checked_div(100).unwrap().checked_mul(self.fee).unwrap();
+            let fee = removed_tokens
+                .checked_div(100)
+                .unwrap()
+                .checked_mul(self.fee)
+                .unwrap();
 
             // Ensure contract has enough balance to fulfill the withdrawal
             if self.env().balance() < removed_tokens {
@@ -133,7 +127,9 @@ pub mod investment_fund {
             self.env()
                 .transfer(caller, removed_tokens.checked_sub(fee).unwrap())
                 .expect("Transfer failed");
-            self.env().transfer(self.manager, fee).expect("Transfer failed");
+            self.env()
+                .transfer(self.manager, fee)
+                .expect("Transfer failed");
 
             Ok(())
         }
